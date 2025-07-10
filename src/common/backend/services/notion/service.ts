@@ -81,8 +81,8 @@ export default class NotionDocumentService implements DocumentService {
     const result: Array<NotionRepository[]> = await Promise.all(
       Object.keys(spaces).map(async (p) => {
         const space = spaces[p];
-        const recentPages = await this.getRecentPageVisits(space.value.id, userId);
-        return this.loadSpace(p, space.value.name, recentPages);
+        const recentPages = await this.getRecentPageVisits(space.spaceId, userId);
+        return this.loadSpace(space.spaceId, space.table, recentPages);
       })
     );
 
@@ -94,11 +94,24 @@ export default class NotionDocumentService implements DocumentService {
     const response = await this.requestWithCookie.post<{
       users: {
         [id: string]: {
+          user_root: {
+            [id: string]: {
+              value: {
+                space_view_pointers: [
+                  {
+                    id: string;
+                    table: string;
+                    spaceId: string;
+                  }
+                ]
+              }
+            };
+          }
           space: any;
         };
       };
     }>('/api/v3/getSpacesInitial');
-    return response.data.users[userId].space;
+    return response.data.users[userId].user_root[userId].value.space_view_pointers;
   };
 
   createDocument = async ({
@@ -152,7 +165,7 @@ export default class NotionDocumentService implements DocumentService {
 
     const userId = Object.keys(this.userContent.recordMap.notion_user)[0] as string;
     const spaces = (await this.getSpaces(userId)) as any;
-    return Object.keys(spaces)[0];
+    return spaces[0].spaceId;
   };
 
   createEmptyFile = async (repository: NotionRepository, title: string) => {
@@ -161,6 +174,8 @@ export default class NotionDocumentService implements DocumentService {
     }
     const spaceId = await this.getSpaceId();
     const documentId = generateUuid();
+    const requestId = generateUuid();
+    const inner_requestId = generateUuid();
     const parentId = repository.id;
     const userId = Object.values(this.userContent.recordMap.notion_user)[0].value.id;
     const time = new Date().getDate();
@@ -271,8 +286,15 @@ export default class NotionDocumentService implements DocumentService {
       ];
     }
 
-    await this.requestWithCookie.post('api/v3/submitTransaction', {
-      operations,
+    await this.requestWithCookie.post('api/v3/saveTransactionsFanout', {
+      requestId: requestId,
+      transactions: [
+        {
+          id: inner_requestId,
+          operations: operations,
+          spaceId: spaceId,
+        }
+      ]
     });
     return documentId;
   };
