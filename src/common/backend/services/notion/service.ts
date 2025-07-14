@@ -82,7 +82,8 @@ export default class NotionDocumentService implements DocumentService {
       Object.keys(spaces).map(async (p) => {
         const space = spaces[p];
         const recentPages = await this.getRecentPageVisits(space.spaceId, userId);
-        return this.loadSpace(space.spaceId, space.table, recentPages);
+        const spaceName = await this.getSpaceName(space.spaceId);
+        return this.loadSpace(space.spaceId, spaceName, recentPages);
       })
     );
 
@@ -113,6 +114,20 @@ export default class NotionDocumentService implements DocumentService {
     }>('/api/v3/getSpacesInitial');
     return response.data.users[userId].user_root[userId].value.space_view_pointers;
   };
+
+  getSpaceName = async (spaceId: string) => {
+    const response = await this.requestWithCookie.post<{
+      results: [
+        {
+          name: string;
+        }
+      ]
+    }>('api/v3/getPublicSpaceData', {
+      spaceIds: [spaceId],
+      type: 'space-ids'
+    });
+    return response.data.results[0].name;
+  }
 
   createDocument = async ({
     repositoryId,
