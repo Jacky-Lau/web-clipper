@@ -66,7 +66,10 @@ module.exports = {
             module: 'esnext',
           },
         },
-        exclude: /node_modules/,
+        exclude: {
+          test: /node_modules/,
+          not: [/@mozilla[\\/]readability/],
+        },
       },
       {
         include: /hypermd|codemirror/,

@@ -1,7 +1,7 @@
 declare module '*.less';
 declare module '*.png';
-declare module '@web-clipper/readability';
-declare module 'turndown-plugin-gfm';
+declare module '@mozilla/readability';
+declare module '@joplin/turndown-plugin-gfm';
 declare module '@web-clipper/remark-pangu';
 declare module 'dva-loading';
 

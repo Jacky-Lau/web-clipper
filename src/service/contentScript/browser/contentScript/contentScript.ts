@@ -2,10 +2,10 @@ import { IContentScriptService, IToggleConfig } from '@/service/common/contentSc
 import { Service, Inject } from 'typedi';
 import styles from '@/service/contentScript/browser/contentScript/contentScript.less';
 import * as QRCode from 'qrcode';
-import { Readability } from '@web-clipper/readability';
+import { Readability } from '@mozilla/readability';
 import AreaSelector from '@web-clipper/area-selector';
 import Highlighter from '@web-clipper/highlight';
-import plugins from '@web-clipper/turndown';
+import plugins from '@/plugins/turndown';
 import TurndownService from 'turndown';
 import { ContentScriptContext } from '@/extensions/common';
 import { localStorageService } from '@/common/chrome/storage';
