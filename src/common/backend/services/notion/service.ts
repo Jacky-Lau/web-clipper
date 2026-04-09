@@ -12,6 +12,15 @@ const PAGE = 'page';
 const COLLECTION_VIEW_PAGE = 'collection_view_page';
 const origin = 'https://www.notion.so/';
 
+// Notion API 新版 recordMap 中每个条目从 { value: DATA, role } 变为 { value: { value: DATA, role } }
+// 此辅助函数兼容新旧两种结构，提取实际数据
+function unwrapValue(entry: any): any {
+  if (entry?.value?.value && typeof entry.value.value === 'object' && 'id' in entry.value.value) {
+    return entry.value.value;
+  }
+  return entry?.value;
+}
+
 export default class NotionDocumentService implements DocumentService {
   private request: AxiosInstance;
   private repositories: NotionRepository[];
@@ -62,7 +71,7 @@ export default class NotionDocumentService implements DocumentService {
     }
     const user = this.userContent.recordMap.notion_user;
     const userInfo = Object.values(user)[0];
-    const { email, profile_photo, name } = userInfo.value;
+    const { email, profile_photo, name } = unwrapValue(userInfo);
     return {
       name,
       avatar: profile_photo,
@@ -78,6 +87,9 @@ export default class NotionDocumentService implements DocumentService {
 
     const userId = Object.keys(this.userContent.recordMap.notion_user)[0] as string;
     const spaces = (await this.getSpaces(userId)) as any;
+    if (!spaces) {
+      return [];
+    }
     const result: Array<NotionRepository[]> = await Promise.all(
       Object.keys(spaces).map(async (p) => {
         const space = spaces[p];
@@ -112,7 +124,10 @@ export default class NotionDocumentService implements DocumentService {
         };
       };
     }>('/api/v3/getSpacesInitial');
-    return response.data.users[userId].user_root[userId].value.space_view_pointers;
+    // Notion API 新版返回结构多嵌套了一层 value
+    const userRoot = response.data?.users?.[userId]?.user_root?.[userId];
+    const rootValue = userRoot?.value?.value ?? userRoot?.value;
+    return rootValue?.space_view_pointers;
   };
 
   getSpaceName = async (spaceId: string) => {
@@ -193,7 +208,7 @@ export default class NotionDocumentService implements DocumentService {
     const requestId = generateUuid();
     const inner_requestId = generateUuid();
     const parentId = repository.id;
-    const userId = Object.values(this.userContent.recordMap.notion_user)[0].value.id;
+    const userId = unwrapValue(Object.values(this.userContent.recordMap.notion_user)[0]).id;
     const time = new Date().getDate();
     let operations;
     if (repository.pageType === PAGE) {
@@ -360,7 +375,8 @@ export default class NotionDocumentService implements DocumentService {
 
     return pages
       .map((pageId): NotionRepository | null => {
-        const value = response.data.recordMap.block[pageId]!.value;
+        const blockEntry = response.data.recordMap.block[pageId]!;
+        const value = unwrapValue(blockEntry);
         if (value.type === PAGE && !!value.properties && !!value.properties.title) {
           return {
             id: value.id,
@@ -375,17 +391,18 @@ export default class NotionDocumentService implements DocumentService {
           value.type === COLLECTION_VIEW_PAGE &&
           !!value.collection_id &&
           !!collections &&
-          !!collections[value.collection_id] &&
-          !!collections[value.collection_id].value &&
-          !!collections[value.collection_id].value.name
+          !!collections[value.collection_id]
         ) {
-          return {
-            id: collections[value.collection_id].value.id,
-            name: collections[value.collection_id].value.name.toString(),
-            groupId: spaceId,
-            groupName: spaceName,
-            pageType: COLLECTION_VIEW_PAGE,
-          };
+          const collectionValue = unwrapValue(collections[value.collection_id]);
+          if (collectionValue && collectionValue.name) {
+            return {
+              id: collectionValue.id,
+              name: collectionValue.name.toString(),
+              groupId: spaceId,
+              groupName: spaceName,
+              pageType: COLLECTION_VIEW_PAGE,
+            };
+          }
         }
         return null;
       })
