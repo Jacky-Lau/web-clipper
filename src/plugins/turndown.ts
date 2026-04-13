@@ -319,6 +319,329 @@ function infoq_code(turndownService: TurndownService) {
 }
 
 // ---------------------------------------------------------------------------
+// Mermaid diagram plugin
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract mermaid source text from an element that still contains the
+ * un-rendered source code (patterns 1-3).
+ */
+function extractMermaidText(el: HTMLElement): string | null {
+  // Pattern 3: <pre><code class="language-mermaid">...</code>
+  const codeLangMermaid = el.querySelector('code.language-mermaid');
+  if (codeLangMermaid?.textContent?.trim()) return codeLangMermaid.textContent.trim();
+
+  // Also try a plain <code> child (e.g. GitHub)
+  const code = el.querySelector('code');
+  if (code?.textContent?.trim()) return code.textContent.trim();
+
+  // Pattern 1/2: direct text nodes (skip SVG children)
+  let text = '';
+  el.childNodes.forEach((n) => {
+    if (n.nodeType === Node.TEXT_NODE) text += n.textContent;
+  });
+  if (text.trim()) return text.trim();
+
+  return null;
+}
+
+/**
+ * Attempt to reconstruct a mermaid flowchart definition from a rendered SVG.
+ * Only supports flowchart type (detected via aria-roledescription).
+ */
+function reconstructFlowchartFromSvg(svg: SVGElement): string | null {
+  // Only handle flowcharts
+  const roleDesc = svg.getAttribute('aria-roledescription') || '';
+  if (!roleDesc.includes('flowchart') && !roleDesc.includes('graph')) {
+    // Fallback: check if there are flowchart-style node groups
+    const hasFlowchartNodes = svg.querySelector('[id^="flowchart-"]');
+    if (!hasFlowchartNodes) return null;
+  }
+
+  // 1. Determine direction – Mermaid encodes it in the aria-roledescription
+  //    e.g. "flowchart-v2" for TD, or we look at the layout
+  let direction = 'TD';
+  const ariaLabel = svg.getAttribute('aria-label') || svg.getAttribute('aria-roledescription') || '';
+  // Try to detect from class or embedded metadata
+  const svgClasses = svg.getAttribute('class') || '';
+  if (svgClasses.includes('flowchart-LR') || ariaLabel.includes('LR')) direction = 'LR';
+  else if (svgClasses.includes('flowchart-RL') || ariaLabel.includes('RL')) direction = 'RL';
+  else if (svgClasses.includes('flowchart-BT') || ariaLabel.includes('BT')) direction = 'BT';
+
+  // 2. Extract subgraphs: <g class="cluster"> elements
+  interface Subgraph {
+    id: string;
+    label: string;
+    nodeIds: string[];
+    element: Element;
+  }
+  const subgraphs: Subgraph[] = [];
+  const clusterGroups = svg.querySelectorAll('g.cluster');
+  clusterGroups.forEach((cluster) => {
+    const labelEl =
+      cluster.querySelector('.cluster-label .nodeLabel') ||
+      cluster.querySelector('.cluster-label') ||
+      cluster.querySelector('text');
+    const label = labelEl?.textContent?.trim() || '';
+    const clusterId = cluster.getAttribute('id') || `subgraph_${subgraphs.length}`;
+    subgraphs.push({ id: clusterId, label, nodeIds: [], element: cluster });
+  });
+
+  // 3. Extract nodes: <g id="flowchart-X-NN"> with nodeLabel text
+  interface FlowNode {
+    id: string;
+    rawId: string;
+    label: string;
+    shape: string; // [], (), {}, (()) etc.
+    element: Element;
+  }
+  const nodes: FlowNode[] = [];
+  const nodeMap = new Map<string, FlowNode>();
+  const nodeGroups = svg.querySelectorAll('[id^="flowchart-"]');
+  nodeGroups.forEach((g) => {
+    const fullId = g.getAttribute('id') || '';
+    // id format: flowchart-<nodeId>-<number>
+    const match = fullId.match(/^flowchart-(.+)-\d+$/);
+    if (!match) return;
+    const nodeId = match[1];
+    if (nodeMap.has(nodeId)) return; // skip duplicates
+
+    const labelEl = g.querySelector('.nodeLabel');
+    const label = labelEl?.textContent?.trim() || nodeId;
+
+    // Determine shape from child element type
+    let shape = '[]'; // default: rectangle
+    if (g.querySelector('circle') || g.querySelector('ellipse')) {
+      shape = '(())';
+    } else if (g.querySelector('polygon')) {
+      // Diamond shape (rhombus) for decisions
+      shape = '{}';
+    } else if (g.querySelector('.label-container')) {
+      // Check the shape of the container
+      const rect = g.querySelector('rect');
+      if (rect) {
+        const rx = parseFloat(rect.getAttribute('rx') || '0');
+        if (rx > 5) shape = '()'; // rounded = stadium shape
+      }
+    } else {
+      // Check for rounded rect
+      const rect = g.querySelector('rect');
+      if (rect) {
+        const rx = parseFloat(rect.getAttribute('rx') || '0');
+        if (rx > 5) shape = '()';
+      }
+    }
+
+    const node: FlowNode = { id: nodeId, rawId: fullId, label, shape, element: g };
+    nodes.push(node);
+    nodeMap.set(nodeId, node);
+  });
+
+  if (nodes.length === 0) return null;
+
+  // 4. Assign nodes to subgraphs based on DOM containment
+  for (const sg of subgraphs) {
+    for (const node of nodes) {
+      if (sg.element.contains(node.element)) {
+        sg.nodeIds.push(node.id);
+      }
+    }
+  }
+
+  // Remove nodes claimed by inner (more specific) subgraphs from outer ones
+  // Sort subgraphs from innermost to outermost
+  for (let i = 0; i < subgraphs.length; i++) {
+    for (let j = 0; j < subgraphs.length; j++) {
+      if (i !== j && subgraphs[j].element.contains(subgraphs[i].element)) {
+        // j is an ancestor of i; remove i's nodes from j
+        subgraphs[j].nodeIds = subgraphs[j].nodeIds.filter(
+          (nid) => !subgraphs[i].nodeIds.includes(nid),
+        );
+      }
+    }
+  }
+
+  // 5. Extract edges: <path> or <line> elements with id like "L-X-Y-0"
+  interface FlowEdge {
+    from: string;
+    to: string;
+    label: string;
+  }
+  const edges: FlowEdge[] = [];
+  const edgePaths = svg.querySelectorAll('[id^="L-"]');
+  edgePaths.forEach((path) => {
+    const pathId = path.getAttribute('id') || '';
+    const edgeMatch = pathId.match(/^L-(.+)-(.+)-\d+$/);
+    if (!edgeMatch) return;
+    const from = edgeMatch[1];
+    const to = edgeMatch[2];
+    // Verify both nodes exist
+    if (!nodeMap.has(from) || !nodeMap.has(to)) return;
+    edges.push({ from, to, label: '' });
+  });
+
+  // Also try to find edges from marker-based paths (alternative Mermaid rendering)
+  if (edges.length === 0) {
+    const allPaths = svg.querySelectorAll('path.flowchart-link, path[class*="edge-pattern"]');
+    allPaths.forEach((path) => {
+      const id = path.getAttribute('id') || '';
+      const edgeMatch = id.match(/^L-(.+)-(.+)-\d+$/);
+      if (edgeMatch) {
+        const from = edgeMatch[1];
+        const to = edgeMatch[2];
+        if (nodeMap.has(from) && nodeMap.has(to)) {
+          edges.push({ from, to, label: '' });
+        }
+      }
+    });
+  }
+
+  // 6. Extract edge labels: <span class="edgeLabel"> in order
+  const edgeLabels: string[] = [];
+  const edgeLabelEls = svg.querySelectorAll('.edgeLabel .edgeLabel, .edgeLabel');
+  const seenLabels = new Set<Element>();
+  edgeLabelEls.forEach((el) => {
+    // Only pick the most specific (innermost) edgeLabel
+    if (seenLabels.has(el)) return;
+    // Skip parent edgeLabel if it has a child edgeLabel
+    const inner = el.querySelector('.edgeLabel');
+    if (inner && inner !== el) {
+      seenLabels.add(el);
+      return;
+    }
+    const text = el.textContent?.trim() || '';
+    edgeLabels.push(text);
+    seenLabels.add(el);
+  });
+
+  // Match edge labels to edges by order
+  for (let i = 0; i < edges.length && i < edgeLabels.length; i++) {
+    edges[i].label = edgeLabels[i];
+  }
+
+  // 7. Assemble output
+  const lines: string[] = [`flowchart ${direction}`];
+  const indent = '    ';
+
+  // Helper to format node definition
+  function formatNode(node: FlowNode): string {
+    const label = node.label;
+    const needsQuotes = label !== node.id;
+    switch (node.shape) {
+      case '()':
+        return needsQuotes ? `${node.id}["${label}"]` : node.id;
+      case '(())':
+        return needsQuotes ? `${node.id}(("${label}"))` : `${node.id}((${node.id}))`;
+      case '{}':
+        return needsQuotes ? `${node.id}{"${label}"}` : `${node.id}{${node.id}}`;
+      default: // []
+        return needsQuotes ? `${node.id}["${label}"]` : node.id;
+    }
+  }
+
+  // Track which nodes are in subgraphs
+  const nodesInSubgraphs = new Set<string>();
+  for (const sg of subgraphs) {
+    for (const nid of sg.nodeIds) {
+      nodesInSubgraphs.add(nid);
+    }
+  }
+
+  // Output subgraphs with their nodes
+  for (const sg of subgraphs) {
+    if (sg.nodeIds.length === 0) continue;
+    const sgLabel = sg.label ? `["${sg.label}"]` : '';
+    // Use a simplified subgraph id
+    const sgId = sg.id.replace(/^subgraph_/, 'SG');
+    lines.push(`${indent}subgraph ${sgId}${sgLabel}`);
+    for (const nid of sg.nodeIds) {
+      const node = nodeMap.get(nid);
+      if (node) {
+        lines.push(`${indent}${indent}${formatNode(node)}`);
+      }
+    }
+    lines.push(`${indent}end`);
+  }
+
+  // Output standalone nodes (not in any subgraph)
+  for (const node of nodes) {
+    if (!nodesInSubgraphs.has(node.id)) {
+      lines.push(`${indent}${formatNode(node)}`);
+    }
+  }
+
+  // Output edges
+  for (const edge of edges) {
+    if (edge.label) {
+      lines.push(`${indent}${edge.from} -->|"${edge.label}"| ${edge.to}`);
+    } else {
+      lines.push(`${indent}${edge.from} --> ${edge.to}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Check whether an element is a mermaid container (rendered or un-rendered).
+ */
+function isMermaidElement(node: Node): node is HTMLElement {
+  if (!(node instanceof HTMLElement)) return false;
+  const tag = node.tagName;
+  const cls = node.className || '';
+  const clsStr = typeof cls === 'string' ? cls : '';
+
+  // Pattern 1: <pre class="mermaid"> / <div class="mermaid">
+  if ((tag === 'PRE' || tag === 'DIV') && clsStr.includes('mermaid')) return true;
+
+  // Pattern 2: <pre lang="mermaid">
+  if (tag === 'PRE' && node.getAttribute('lang') === 'mermaid') return true;
+
+  // Pattern 3: parent <pre> of <code class="language-mermaid">
+  if (tag === 'PRE' && node.querySelector('code.language-mermaid')) return true;
+
+  // Pattern 4: <figure data-type="mermaid">
+  if (tag === 'FIGURE' && node.getAttribute('data-type') === 'mermaid') return true;
+
+  // Pattern 5: container with svg[aria-roledescription*="flowchart"] and class contains mermaid
+  if (clsStr.includes('mermaid') && node.querySelector('svg[aria-roledescription]')) return true;
+
+  // Pattern 6: direct parent of svg[id^="mermaid"]
+  if (node.querySelector(':scope > svg[id^="mermaid"]')) return true;
+
+  return false;
+}
+
+function mermaidDiagram(turndownService: TurndownService) {
+  turndownService.addRule('mermaidDiagram', {
+    filter(node: Node) {
+      return isMermaidElement(node);
+    },
+    replacement(_content: string, node: Node) {
+      const el = node as HTMLElement;
+
+      // Try to extract un-rendered source text first (patterns 1-3)
+      const sourceText = extractMermaidText(el);
+      if (sourceText) {
+        return `\`\`\`mermaid\n${sourceText}\n\`\`\`\n\n`;
+      }
+
+      // Try SVG reverse-engineering for rendered diagrams (patterns 4-6)
+      const svg = el.querySelector('svg');
+      if (svg) {
+        const reconstructed = reconstructFlowchartFromSvg(svg as SVGElement);
+        if (reconstructed) {
+          return `\`\`\`mermaid\n${reconstructed}\n\`\`\`\n\n`;
+        }
+      }
+
+      // Fallback: placeholder
+      return '[mermaid diagram]\n\n';
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Content plugins
 // ---------------------------------------------------------------------------
 
@@ -467,5 +790,9 @@ export default function plugins(turndownService: TurndownService) {
     strong,
     syntaxhighlighter,
     infoq_code,
+    // Must be LAST: addRule uses unshift(), so the last-registered rule
+    // has the highest priority. This ensures mermaid detection runs before
+    // hexoCodeBlock (which matches all <figure>/<table> elements).
+    mermaidDiagram,
   ]);
 }
